@@ -6,9 +6,10 @@ batch_size = 32
 block_size = 8
 max_iters = 3000
 eval_interval = 300
-learning_rate = 1e-2
+learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
+n_embd = 32
 
 torch.manual_seed(1337)
 
@@ -34,13 +35,7 @@ val_data = data[n:]
 # 数据加载
 def get_batch(split):
     data = train_data if split == 'train' else val_data
-    # 从数据中随机选择batch_size个起始位置，每个位置后面有block_size个字符
-    # 之所以是len(data) - block_size，是因为需要保证从起始位置开始的block_size个字符都在数据范围内
-    # 例如，如果数据长度是100，block_size是8，那么起始位置的最大值应该是92，因为从位置92开始的8个字符是数据的最后8个字符。
-    # randint接收一个范围和一个形状参数，返回在该范围内随机生成的整数张量，形状要求是元组
     ix = torch.randint(len(data) - block_size, (batch_size,))  
-    # 从每个起始位置开始，取block_size个字符作为输入x，取从起始位置的下一个字符开始的block_size个字符作为目标y
-    # y是指向右偏移一个字符的输入x，表示要预测的下一个字符
     x = torch.stack([data[i:i+block_size] for i in ix])
     y = torch.stack([data[i+1:i+block_size+1] for i in ix])
     return x.to(device), y.to(device)
@@ -59,17 +54,86 @@ def estimate_loss():
     model.train()  # 将模型设置回训练模式
     return out
 
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        # 注册缓冲区的主要目的是让这个张量在模型保存和加载时可以随着模型的状态一起保存和加载。
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)   # (B, T, head_size)
+        q = self.query(x) # (B, T, head_size)
+        v = self.value(x) # (B, T, head_size)
+
+        # 计算注意力权重
+        wei = q @ k.transpose(-2, -1) * C**-0.5  # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # 将上三角部分的权重设置为负无穷，确保模型只能关注当前和之前的字符
+        wei = F.softmax(wei, dim=-1)  # (B, T, T)，对最后一个维度进行softmax，得到注意力权重
+
+        out = wei @ v  # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
+        return out
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+
+    def forward(self, x):
+
+        out = torch.cat([h(x) for h in self.heads], dim=-1)  # 将多个头的输出在最后一个维度(通道维度)上拼接起来 
+        return out
+
+class FeedForward(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, n_embd),   # 基于每一个token进行的计算
+            nn.ReLU(),                    # 激活函数，增加非线性
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa_head = MultiHeadAttention(num_heads=n_head, head_size=head_size)  # communication
+        self.ffwd = FeedForward(n_embd)  # computation
+
+    def forward(self, x):
+        x = self.sa_head(x)  # (B, T, n_embd)
+        x = self.ffwd(x)     # (B, T, n_embd)
+        return x
 
 class BigramLanguageModel(nn.Module):
     def __init__(self, vocab_size):
         super().__init__()
-        # 转化为一个(vocab_size, vocab_size)的矩阵，行是输入字符，列是输出字符，值是对应的logit
-        # 我们要预测下一个字符的概率分布，而这个分布的维度就是vocab_size，所以每个输入字符都对应一个长度为vocab_size的向量，表示对每个可能输出字符的logit值。
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.Block = nn.Sequential(
+            Block(n_embd, n_head=4),
+            Block(n_embd, n_head=4),
+            Block(n_embd, n_head=4),
+        )
+        # self.sa_head = MultiHeadAttention(num_heads=4, head_size=n_embd//4)  # 4个头，每个头的维度是n_embd//4，这样拼接起来的维度就是n_embd
+        # self.ffwd = FeedForward(n_embd)  # 前馈神经网络，输入和输出的维度都是n_embd
+        self.lm_head = nn.Linear(n_embd, vocab_size) # 经过了线性层才能获得logits
 
     def forward(self, idx, targets=None):
+        B, T = idx.shape
+
         # idx和targets都是(B, T)的张量，B是批量大小，T是序列长度
-        logits = self.token_embedding_table(idx)  # (B, T, C)，C是vocab_size
+        tok_emb = self.token_embedding_table(idx)  # (B, T, C)
+        position_emb = self.position_embedding_table(torch.arange(T, device))  # (T, C)
+        x = tok_emb + position_emb  # (B, T, C)
+        x = self.sa_head(x)  # (B, T, C)
+        x = self.ffwd(x)  # (B, T, C)，没有加前馈网络直接进行下一步的话模型没有时间进行思考从其他tokens获得了什么
+        logits = self.lm_head(x)  # (B, T, vocab_size)
 
         if targets is None:
             loss = None
@@ -84,7 +148,8 @@ class BigramLanguageModel(nn.Module):
     def generate(self, idx, max_new_tokens):
         # idx是(B, T)的张量，表示当前上下文的索引数组；max_new_tokens是要生成的新令牌的数量
         for _ in range(max_new_tokens):
-            logits, loss = self(idx)  # (B, T, C)
+            idx_cond = idx[:, -block_size:]  # (B, block_size)，取当前上下文的最后block_size个索引，确保输入长度不超过模型的最大上下文长度
+            logits, loss = self(idx_cond)  # (B, T, C)
             logits = logits[:, -1, :]  # (B, C)，取最后一个时间步的logits
             probs = F.softmax(logits, dim=-1)  # (B, C)，计算概率分布
             idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)，从概率分布中采样下一个字符的索引
