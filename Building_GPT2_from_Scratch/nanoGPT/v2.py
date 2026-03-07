@@ -1,15 +1,24 @@
+''' 这是一个transformers仅解码器的模型，因为目标只是生成文本
+    只有掩码多头自注意力（具有自回归特性）、前馈网络、层归一化，没有交叉注意力
+
+
+'''
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-batch_size = 32
-block_size = 8
-max_iters = 3000
-eval_interval = 300
-learning_rate = 1e-3
+batch_size = 64
+block_size = 256
+max_iters = 5000
+eval_interval = 500
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
-n_embd = 32
+n_embd = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2
 
 torch.manual_seed(1337)
 
@@ -63,6 +72,8 @@ class Head(nn.Module):
         # 注册缓冲区的主要目的是让这个张量在模型保存和加载时可以随着模型的状态一起保存和加载。
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
         B, T, C = x.shape
         k = self.key(x)   # (B, T, head_size)
@@ -73,6 +84,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**-0.5  # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # 将上三角部分的权重设置为负无穷，确保模型只能关注当前和之前的字符
         wei = F.softmax(wei, dim=-1)  # (B, T, T)，对最后一个维度进行softmax，得到注意力权重
+        wei = self.dropout(wei)  # 应用dropout，随机阻止某些节点间的通信，以防模型过大过拟合
 
         out = wei @ v  # (B, T, T) @ (B, T, head_size) -> (B, T, head_size)
         return out
@@ -81,18 +93,23 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)  # 将多头的输出投影回原来的维度
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
 
         out = torch.cat([h(x) for h in self.heads], dim=-1)  # 将多个头的输出在最后一个维度(通道维度)上拼接起来 
+        out = self.dropout(self.proj(out))  # 将拼接后的输出通过线性层投影回原来的维度，并应用dropout
         return out
 
 class FeedForward(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, n_embd),   # 基于每一个token进行的计算
+            nn.Linear(n_embd, 4 * n_embd),   # 基于每一个token进行的计算，论文里面的数值
             nn.ReLU(),                    # 激活函数，增加非线性
+            nn.Linear(4 * n_embd, n_embd),   # 将维度投影回原来的维度
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
@@ -102,12 +119,14 @@ class Block(nn.Module):
     def __init__(self, n_embd, n_head):
         super().__init__()
         head_size = n_embd // n_head
-        self.sa_head = MultiHeadAttention(num_heads=n_head, head_size=head_size)  # communication
+        self.sa = MultiHeadAttention(num_heads=n_head, head_size=head_size)  # communication
         self.ffwd = FeedForward(n_embd)  # computation
+        self.ln1 = nn.LayerNorm(n_embd)  # layer normalization
+        self.ln2 = nn.LayerNorm(n_embd)  
 
     def forward(self, x):
-        x = self.sa_head(x)  # (B, T, n_embd)
-        x = self.ffwd(x)     # (B, T, n_embd)
+        x = x + self.sa(self.ln1(x))  # (B, T, n_embd) 这里与论文不同，论文中是先进行多头注意力计算，然后再进行残差连接和层归一化；这里直接在多头注意力计算后进行残差连接和层归一化
+        x = x + self.ffwd(self.ln2(x))     # (B, T, n_embd)
         return x
 
 class BigramLanguageModel(nn.Module):
@@ -115,11 +134,8 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.Block = nn.Sequential(
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-        )
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=4) for _ in range(n_layer)])  # 堆叠多个Block，每个Block包含多头注意力和前馈神经网络
+        self.ln_f = nn.LayerNorm(n_embd)  # 最后的层归一化
         # self.sa_head = MultiHeadAttention(num_heads=4, head_size=n_embd//4)  # 4个头，每个头的维度是n_embd//4，这样拼接起来的维度就是n_embd
         # self.ffwd = FeedForward(n_embd)  # 前馈神经网络，输入和输出的维度都是n_embd
         self.lm_head = nn.Linear(n_embd, vocab_size) # 经过了线性层才能获得logits
@@ -131,8 +147,10 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx)  # (B, T, C)
         position_emb = self.position_embedding_table(torch.arange(T, device))  # (T, C)
         x = tok_emb + position_emb  # (B, T, C)
-        x = self.sa_head(x)  # (B, T, C)
-        x = self.ffwd(x)  # (B, T, C)，没有加前馈网络直接进行下一步的话模型没有时间进行思考从其他tokens获得了什么
+        x = self.blocks(x)  # (B, T, C)
+        x = self.ln_f(x)  # (B, T, C)
+        # x = self.sa_head(x)  # (B, T, C)
+        # x = self.ffwd(x)  # (B, T, C)，没有加前馈网络直接进行下一步的话模型没有时间进行思考从其他tokens获得了什么
         logits = self.lm_head(x)  # (B, T, vocab_size)
 
         if targets is None:
@@ -158,6 +176,9 @@ class BigramLanguageModel(nn.Module):
 
 model = BigramLanguageModel(vocab_size).to(device)
 m = model.to(device)
+
+print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')  # 计算模型的参数数量，并以百万为单位打印出来
+
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 for steps in range(max_iters):
